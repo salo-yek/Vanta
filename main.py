@@ -134,12 +134,21 @@ class LaunchWorker(QThread):
 
             self.progress_updated.emit("Preparing launch...", 100)
             
+            # Resolve the data path with camelCase formatting (.Vanta)
+            if sys.platform == "win32":
+                vanta_dir = os.path.join(os.environ.get("APPDATA", ""), ".Vanta")
+            else:
+                vanta_dir = os.path.expanduser("~/.Vanta")
+                
+            os.makedirs(vanta_dir, exist_ok=True)
+
             options = {
                 "username": self.username,
                 "uuid": str(uuid.uuid4()),
                 "token": "",
                 "launcherName": "Vanta",
                 "launcherVersion": "1.0",
+                "gameDirectory": vanta_dir
             }
 
             # If system Java is absent and the version doesn't bundle its own runtime,
@@ -169,6 +178,7 @@ class LaunchWorker(QThread):
                 command,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
+                cwd=vanta_dir,
                 creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
             )
             self.launch_success.emit()
@@ -680,7 +690,6 @@ class MinecraftLauncher(QMainWindow):
 
         self._save_settings()
 
-        # Check Java availability before initializing launch routine
         has_system_java = shutil.which("java") is not None
 
         try:
@@ -690,7 +699,6 @@ class MinecraftLauncher(QMainWindow):
         except Exception:
             runtime_info = None
 
-        # Prompt download for legacy versions without native Mojang runtimes if global Java is missing
         if not has_system_java and runtime_info is None:
             legacy_exec = minecraft_launcher_lib.runtime.get_executable_path("jre-legacy", self.minecraft_dir)
             if not legacy_exec:
