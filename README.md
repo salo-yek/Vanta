@@ -34,6 +34,7 @@ git clone [https://github.com/salo-yek/Vanta.git](https://github.com/salo-yek/Va
 cd Vanta
 pip install -r requirements.txt
 python main.py
+```
 
 ## 📝 License
 
