@@ -39,3 +39,11 @@ python main.py
 ## 📝 License
 
 This project is open-source. Feel free to fork and build upon it!
+
+---
+
+## 📸 Screenshots
+
+| Empty Launcher | Profile Preview | Version Selection | Downloading Assets |
+| :---: | :---: | :---: | :---: |
+| <img src="https://github.com/user-attachments/assets/518519f8-00d0-4368-862b-ec866f628456" width="220" alt="Vanta Launcher Empty UI" /> | <img src="https://github.com/user-attachments/assets/f4062168-dce9-4840-a2b5-ee974d53d726" width="220" alt="Vanta Launcher User Profile" /> | <img src="https://github.com/user-attachments/assets/f388e763-2ec8-465c-8518-f7cefbc07aee" width="220" alt="Vanta Launcher Version List" /> | <img src="https://github.com/user-attachments/assets/396f5983-b7cf-4723-82e4-2043afa248c7" width="220" alt="Vanta Launcher Downloading Assets" /> |
