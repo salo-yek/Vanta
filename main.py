@@ -6,7 +6,6 @@ import ctypes
 import shutil
 import requests
 import threading
-import re
 from ctypes import wintypes
 from typing import List, Optional
 
@@ -16,16 +15,15 @@ except ImportError:
     Presence = None
 
 from PyQt6.QtCore import (
-    QThread, pyqtSignal, Qt, QSettings, QPoint, QPropertyAnimation, 
+    QThread, pyqtSignal, Qt, QSettings, QPoint, QPropertyAnimation,
     QEasingCurve, QEvent, QParallelAnimationGroup, QRect, QTimer
 )
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QLineEdit, QComboBox, QPushButton, QMessageBox, QGraphicsDropShadowEffect, 
+    QLineEdit, QComboBox, QPushButton, QMessageBox, QGraphicsDropShadowEffect,
     QFrame, QLabel, QStackedWidget, QSlider, QCheckBox, QListWidget, QListWidgetItem,
     QProgressBar
 )
-
 from PyQt6.QtGui import QColor, QFont, QImage, QPainter, QBrush, QPolygon, QIcon, QPixmap
 
 import minecraft_launcher_lib
@@ -39,51 +37,52 @@ API_HEADERS = {
 
 def silence_asyncio_windows_bugs() -> None:
     """
-    Monkeypatch to silence unhandled ValueError/RuntimeError tracebacks on Windows 
-    during asyncio loop teardown (specifically closed pipe transport cleanup).
+    Patch asyncio transport destructors on Windows to suppress benign errors
+    during process exit (ValueError/RuntimeError on closed pipe).
     """
-    if sys.platform == "win32":
-        try:
-            import asyncio
-            from asyncio import proactor_events, base_subprocess
-            
-            if hasattr(proactor_events, "_ProactorBasePipeTransport"):
-                org_pipe_del = proactor_events._ProactorBasePipeTransport.__del__
-                def patched_pipe_del(self):
-                    try:
-                        org_pipe_del(self)
-                    except (ValueError, OSError, RuntimeError):
-                        pass
-                proactor_events._ProactorBasePipeTransport.__del__ = patched_pipe_del
+    if sys.platform != "win32":
+        return
+    try:
+        import asyncio
+        from asyncio import proactor_events, base_subprocess
 
-            if hasattr(base_subprocess, "BaseSubprocessTransport"):
-                org_sub_del = base_subprocess.BaseSubprocessTransport.__del__
-                def patched_sub_del(self):
-                    try:
-                        org_sub_del(self)
-                    except (ValueError, OSError, RuntimeError):
-                        pass
-                base_subprocess.BaseSubprocessTransport.__del__ = patched_sub_del
-        except Exception:
-            pass
+        if hasattr(proactor_events, "_ProactorBasePipeTransport"):
+            original_del = proactor_events._ProactorBasePipeTransport.__del__
+
+            def patched_pipe_del(self):
+                try:
+                    original_del(self)
+                except (ValueError, OSError, RuntimeError):
+                    pass
+
+            proactor_events._ProactorBasePipeTransport.__del__ = patched_pipe_del
+
+        if hasattr(base_subprocess, "BaseSubprocessTransport"):
+            original_sub_del = base_subprocess.BaseSubprocessTransport.__del__
+
+            def patched_sub_del(self):
+                try:
+                    original_sub_del(self)
+                except (ValueError, OSError, RuntimeError):
+                    pass
+
+            base_subprocess.BaseSubprocessTransport.__del__ = patched_sub_del
+    except Exception:
+        # If patching fails, keep the original behavior.
+        pass
 
 
 def is_fabric_compatible(version: str) -> bool:
-    """Fabric loader officially supports Minecraft 1.14 and newer."""
+    """Fabric loader requires Minecraft 1.14 or higher."""
     try:
         core = version.split("-")[0]
         parts = core.split(".")
-        if len(parts) >= 2:
-            major = int(parts[0])
-            minor = int(parts[1])
-            if major > 1:
-                return True
-            if major == 1 and minor >= 14:
-                return True
+        if len(parts) < 2:
             return False
-        return True
+        major, minor = int(parts[0]), int(parts[1])
+        return (major > 1) or (major == 1 and minor >= 14)
     except (ValueError, IndexError):
-        return True
+        return False
 
 
 class VersionFetchWorker(QThread):
@@ -114,21 +113,21 @@ class JavaDownloadWorker(QThread):
 
     def run(self) -> None:
         try:
-            def _set_status(text: str) -> None:
+            def set_status(text: str) -> None:
                 self.progress.emit(text, -1)
 
-            def _set_max(val: int) -> None:
+            def set_max(val: int) -> None:
                 self._max_val = val
 
-            def _set_progress(val: int) -> None:
+            def set_progress(val: int) -> None:
                 if self._max_val > 0:
                     percent = int((val / self._max_val) * 100)
                     self.progress.emit("Downloading Java...", percent)
 
             callbacks = {
-                "setStatus": _set_status,
-                "setProgress": _set_progress,
-                "setMax": _set_max,
+                "setStatus": set_status,
+                "setProgress": set_progress,
+                "setMax": set_max,
             }
 
             minecraft_launcher_lib.runtime.install_jvm_runtime(
@@ -146,33 +145,35 @@ class LaunchWorker(QThread):
     error_occurred = pyqtSignal(str)
     performance_mods_installed = pyqtSignal()
 
-    def __init__(self, username: str, version: str, minecraft_dir: str, ram_gb: int, performance_mode: bool):
+    def __init__(self, username: str, version: str, minecraft_dir: str,
+                 ram_gb: int, performance_mode: bool, java_path: Optional[str] = None):
         super().__init__()
         self.username = username
         self.version = version
         self.minecraft_dir = minecraft_dir
         self.ram_gb = ram_gb
         self.performance_mode = performance_mode
+        self.java_path = java_path
         self._max_val = 0
         self.process = None
 
     def run(self) -> None:
         try:
-            def _set_status(text: str) -> None:
+            def set_status(text: str) -> None:
                 self.progress_updated.emit(text, -1)
 
-            def _set_max(val: int) -> None:
+            def set_max(val: int) -> None:
                 self._max_val = val
 
-            def _set_progress(val: int) -> None:
+            def set_progress(val: int) -> None:
                 if self._max_val > 0:
                     percent = int((val / self._max_val) * 100)
                     self.progress_updated.emit("Installing...", percent)
 
             callbacks = {
-                "setStatus": _set_status,
-                "setProgress": _set_progress,
-                "setMax": _set_max,
+                "setStatus": set_status,
+                "setProgress": set_progress,
+                "setMax": set_max,
             }
 
             installed = [
@@ -196,22 +197,23 @@ class LaunchWorker(QThread):
                     ) from net_err
 
             self.progress_updated.emit("Preparing launch...", 100)
-            
-            if sys.platform == "win32":
-                vanta_dir = os.path.join(os.environ.get("APPDATA", ""), ".Vanta")
-            else:
-                vanta_dir = os.path.expanduser("~/.Vanta")
-                
-            # Isolate game directories to avoid config/world corruption between versions
+
+            vanta_dir = os.path.join(
+                os.environ.get("APPDATA", "") if sys.platform == "win32" else os.path.expanduser("~"),
+                ".Vanta"
+            )
+
             instance_dir = os.path.join(vanta_dir, "instances", self.version)
             os.makedirs(instance_dir, exist_ok=True)
 
-            # Force Fabric if any user-installed mods exist, ignoring fabric-api itself
             mods_dir = os.path.join(instance_dir, "mods")
             has_custom_mods = False
             if os.path.exists(mods_dir):
                 try:
-                    jars = [f for f in os.listdir(mods_dir) if f.endswith(".jar") and "fabric-api" not in f.lower() and "fabric_api" not in f.lower()]
+                    jars = [
+                        f for f in os.listdir(mods_dir)
+                        if f.endswith(".jar") and "fabric-api" not in f.lower() and "fabric_api" not in f.lower()
+                    ]
                     has_custom_mods = len(jars) > 0
                 except Exception:
                     pass
@@ -227,7 +229,7 @@ class LaunchWorker(QThread):
                     target_version = f"fabric-loader-{latest_loader}-{self.version}"
                     self._ensure_fabric_api_and_mods(instance_dir, self.performance_mode)
                 except Exception as e:
-                    sys.stderr.write(f"Mod environment installation failed: {e}\n")
+                    sys.stderr.write(f"Fabric/mod installation error: {e}\n")
 
             options = {
                 "username": self.username,
@@ -260,17 +262,31 @@ class LaunchWorker(QThread):
                 ]
             }
 
-            if not shutil.which("java"):
+            # Set Java executable if explicitly provided
+            if self.java_path:
+                options["executablePath"] = self.java_path
+            else:
+                # Try to locate a bundled runtime if no explicit path is given
                 try:
                     runtime_info = minecraft_launcher_lib.runtime.get_version_runtime_information(
                         self.version, self.minecraft_dir
                     )
-                    runtime_info = None
+                    if runtime_info:
+                        runtime_name = runtime_info.get("name")
+                        if runtime_name:
+                            java_exec = minecraft_launcher_lib.runtime.get_executable_path(
+                                runtime_name, self.minecraft_dir
+                            )
+                            if java_exec:
+                                options["executablePath"] = java_exec
                 except Exception:
-                    runtime_info = None
+                    pass
 
-                if runtime_info is None:
-                    legacy_exec = minecraft_launcher_lib.runtime.get_executable_path("jre-legacy", self.minecraft_dir)
+                # Fallback to legacy runtime
+                if "executablePath" not in options:
+                    legacy_exec = minecraft_launcher_lib.runtime.get_executable_path(
+                        "jre-legacy", self.minecraft_dir
+                    )
                     if legacy_exec:
                         options["executablePath"] = legacy_exec
 
@@ -281,8 +297,7 @@ class LaunchWorker(QThread):
             )
 
             self.progress_updated.emit("Launching...", 100)
-            
-            # Capture stdout/stderr directly to latest.log for troubleshooting
+
             log_path = os.path.join(instance_dir, "latest.log")
             log_file = open(log_path, "w", encoding="utf-8")
             try:
@@ -311,18 +326,24 @@ class LaunchWorker(QThread):
     def _ensure_fabric_api_and_mods(self, instance_dir: str, download_perf_mods: bool) -> None:
         mods_dir = os.path.join(instance_dir, "mods")
         os.makedirs(mods_dir, exist_ok=True)
-        
+
         mods_to_download = ["fabric-api"]
         if download_perf_mods:
             mods_to_download.extend(["sodium", "lithium", "ferrite-core", "entityculling"])
-            
+
+        # Remove duplicates preserving order
+        seen = set()
         mods = []
         for m in mods_to_download:
-            if m not in mods:
+            if m not in seen:
+                seen.add(m)
                 mods.append(m)
-        
+
         try:
-            local_files = [f.lower().replace("-", "").replace("_", "") for f in os.listdir(mods_dir) if f.endswith(".jar")]
+            local_files = [
+                f.lower().replace("-", "").replace("_", "")
+                for f in os.listdir(mods_dir) if f.endswith(".jar")
+            ]
         except Exception:
             local_files = []
 
@@ -334,34 +355,41 @@ class LaunchWorker(QThread):
             "entityculling": "entityculling"
         }
 
-        headers = API_HEADERS
-        
         for i, mod in enumerate(mods):
             sig = mod_signatures.get(mod, mod).replace("-", "").replace("_", "")
-            
+
             if any(sig in f for f in local_files):
                 continue
 
             try:
                 self.progress_updated.emit(f"Checking {mod}...", int(20 + (i / len(mods)) * 60))
-                url = f"https://api.modrinth.com/v2/project/{mod}/version?loaders=[\"fabric\"]&game_versions=[\"{self.version}\"]"
-                r = requests.get(url, headers=headers, timeout=5)
+                params = {
+                    "loaders": "fabric",
+                    "game_versions": [self.version]  # Modrinth expects list for game_versions
+                }
+                url = f"https://api.modrinth.com/v2/project/{mod}/version"
+                r = requests.get(url, headers=API_HEADERS, params=params, timeout=5)
                 if r.status_code == 200:
                     data = r.json()
-                    if data:
-                        file_info = data[0]["files"][0]
-                        for f in data[0]["files"]:
-                            if f.get("primary"):
-                                file_info = f
-                                break
-                        
-                        dest_path = os.path.join(mods_dir, file_info["filename"])
-                        if not os.path.exists(dest_path):
-                            self.progress_updated.emit(f"Downloading {mod}...", int(20 + (i / len(mods)) * 60))
-                            dl_res = requests.get(file_info["url"], headers=headers, timeout=10)
-                            if dl_res.status_code == 200:
-                                with open(dest_path, "wb") as out:
-                                    out.write(dl_res.content)
+                    if not data:
+                        continue
+
+                    # Pick primary file, fallback to first
+                    file_info = data[0]["files"][0]
+                    for f in data[0]["files"]:
+                        if f.get("primary"):
+                            file_info = f
+                            break
+
+                    dest_path = os.path.join(mods_dir, file_info["filename"])
+                    if os.path.exists(dest_path):
+                        continue
+
+                    self.progress_updated.emit(f"Downloading {mod}...", int(20 + (i / len(mods)) * 60))
+                    dl_res = requests.get(file_info["url"], headers=API_HEADERS, timeout=10)
+                    if dl_res.status_code == 200:
+                        with open(dest_path, "wb") as out:
+                            out.write(dl_res.content)
             except Exception as e:
                 sys.stderr.write(f"Error downloading {mod}: {e}\n")
 
@@ -386,6 +414,7 @@ class AvatarLoaderWorker(QThread):
                 pixmap.loadFromData(r.content)
                 self.avatar_loaded.emit(pixmap)
         except Exception:
+            # Silently ignore avatar loading failures
             pass
 
 
@@ -398,8 +427,13 @@ class ModSearchWorker(QThread):
 
     def run(self) -> None:
         try:
-            url = f"https://api.modrinth.com/v2/search?query={self.query}&facets=[[\"categories:fabric\"],[\"project_type:mod\"]]"
-            r = requests.get(url, headers=API_HEADERS, timeout=5)
+            params = {
+                "query": self.query,
+                "facets": json.dumps([["categories:fabric"], ["project_type:mod"]]),
+                "loaders": "fabric"
+            }
+            r = requests.get("https://api.modrinth.com/v2/search",
+                             headers=API_HEADERS, params=params, timeout=5)
             if r.status_code == 200:
                 hits = r.json().get("hits", [])
                 self.results_ready.emit(hits)
@@ -421,31 +455,35 @@ class ModInstallWorker(QThread):
     def run(self) -> None:
         try:
             self.progress.emit("Locating version...")
-            url = f"https://api.modrinth.com/v2/project/{self.project_id}/version?loaders=[\"fabric\"]&game_versions=[\"{self.mc_version}\"]"
-            r = requests.get(url, headers=API_HEADERS, timeout=5)
+            params = {
+                "loaders": "fabric",
+                "game_versions": [self.mc_version]
+            }
+            url = f"https://api.modrinth.com/v2/project/{self.project_id}/version"
+            r = requests.get(url, headers=API_HEADERS, params=params, timeout=5)
             if r.status_code == 200:
                 data = r.json()
                 if not data:
-                    raise ValueError("No matching versions found.")
-                
+                    raise ValueError("No compatible versions found.")
+
                 file_info = data[0]["files"][0]
                 for f in data[0]["files"]:
                     if f.get("primary"):
                         file_info = f
                         break
-                
+
                 self.progress.emit(f"Downloading {file_info['filename']}...")
                 dest = os.path.join(self.instance_dir, "mods", file_info["filename"])
                 os.makedirs(os.path.dirname(dest), exist_ok=True)
-                
+
                 dl_res = requests.get(file_info["url"], headers=API_HEADERS, timeout=10)
                 if dl_res.status_code == 200:
                     with open(dest, "wb") as f:
                         f.write(dl_res.content)
                 else:
                     raise ValueError("Download failed.")
-                
-                # Treat Fabric API as a hard dependency if any mod is installed
+
+                # Ensure Fabric API is present as a dependency
                 self._ensure_fabric_api()
                 self.finished.emit()
         except Exception as e:
@@ -454,9 +492,12 @@ class ModInstallWorker(QThread):
     def _ensure_fabric_api(self) -> None:
         mods_dir = os.path.join(self.instance_dir, "mods")
         os.makedirs(mods_dir, exist_ok=True)
-        
+
         try:
-            local_files = [f.lower().replace("-", "").replace("_", "") for f in os.listdir(mods_dir) if f.endswith(".jar")]
+            local_files = [
+                f.lower().replace("-", "").replace("_", "")
+                for f in os.listdir(mods_dir) if f.endswith(".jar")
+            ]
         except Exception:
             local_files = []
 
@@ -465,30 +506,40 @@ class ModInstallWorker(QThread):
 
         self.progress.emit("Downloading Fabric API dependency...")
         try:
-            url = f"https://api.modrinth.com/v2/project/fabric-api/version?loaders=[\"fabric\"]&game_versions=[\"{self.mc_version}\"]"
-            r = requests.get(url, headers=API_HEADERS, timeout=5)
+            params = {
+                "loaders": "fabric",
+                "game_versions": [self.mc_version]
+            }
+            r = requests.get("https://api.modrinth.com/v2/project/fabric-api/version",
+                             headers=API_HEADERS, params=params, timeout=5)
             if r.status_code == 200:
                 data = r.json()
-                if data:
-                    file_info = data[0]["files"][0]
-                    for f in data[0]["files"]:
-                        if f.get("primary"):
-                            file_info = f
-                            break
-                    
-                    dest_path = os.path.join(mods_dir, file_info["filename"])
-                    dl_res = requests.get(file_info["url"], headers=API_HEADERS, timeout=10)
-                    if dl_res.status_code == 200:
-                        with open(dest_path, "wb") as out:
-                            out.write(dl_res.content)
+                if not data:
+                    return
+
+                file_info = data[0]["files"][0]
+                for f in data[0]["files"]:
+                    if f.get("primary"):
+                        file_info = f
+                        break
+
+                dest_path = os.path.join(mods_dir, file_info["filename"])
+                if os.path.exists(dest_path):
+                    return
+
+                dl_res = requests.get(file_info["url"], headers=API_HEADERS, timeout=10)
+                if dl_res.status_code == 200:
+                    with open(dest_path, "wb") as out:
+                        out.write(dl_res.content)
         except Exception as e:
             sys.stderr.write(f"Failed to auto-download Fabric API: {e}\n")
 
 
 def _generate_arrow_image() -> str:
-    temp_dir = os.path.join(os.path.expanduser("~"), ".mclaunch")
+    """Generate a small arrow PNG for combo boxes; stores it in a hidden user folder."""
+    temp_dir = os.path.join(os.path.expanduser("~"), ".vanta_assets")
     os.makedirs(temp_dir, exist_ok=True)
-    arrow_path = os.path.join(temp_dir, "arrow.png").replace("\\", "/")
+    arrow_path = os.path.join(temp_dir, "arrow.png")
 
     if os.path.exists(arrow_path):
         return arrow_path
@@ -506,15 +557,16 @@ def _generate_arrow_image() -> str:
 
         image.save(arrow_path)
     except Exception as e:
-        sys.stderr.write(f"Resource generation failure: {e}\n")
+        sys.stderr.write(f"Failed to generate arrow image: {e}\n")
 
     return arrow_path
 
 
 def _generate_settings_image() -> str:
-    temp_dir = os.path.join(os.path.expanduser("~"), ".mclaunch")
+    """Generate a hamburger menu icon for the settings button."""
+    temp_dir = os.path.join(os.path.expanduser("~"), ".vanta_assets")
     os.makedirs(temp_dir, exist_ok=True)
-    settings_path = os.path.join(temp_dir, "settings.png").replace("\\", "/")
+    settings_path = os.path.join(temp_dir, "settings.png")
 
     if os.path.exists(settings_path):
         return settings_path
@@ -528,7 +580,6 @@ def _generate_settings_image() -> str:
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QBrush(QColor("#A0A0A2")))
 
-        # Draw programmatic clean hamburger menu icon (3 bars) to avoid system font emoji issues
         painter.drawRoundedRect(QRect(1, 3, 14, 2), 1, 1)
         painter.drawRoundedRect(QRect(1, 7, 14, 2), 1, 1)
         painter.drawRoundedRect(QRect(1, 11, 14, 2), 1, 1)
@@ -536,7 +587,7 @@ def _generate_settings_image() -> str:
         painter.end()
         image.save(settings_path)
     except Exception as e:
-        sys.stderr.write(f"Settings icon generation failure: {e}\n")
+        sys.stderr.write(f"Failed to generate settings icon: {e}\n")
 
     return settings_path
 
@@ -554,17 +605,17 @@ class MinecraftLauncher(QMainWindow):
         self._drawer_expanded = False
         self.rpc = None
         self._rpc_lock = threading.Lock()
-        self._workers = []  # Registry for safe shutdown
-        
+        self._workers: list = []
+        self._launch_in_progress = False
+
         if sys.platform == "win32":
             self.vanta_dir = os.path.join(os.environ.get("APPDATA", ""), ".Vanta")
         else:
             self.vanta_dir = os.path.expanduser("~/.Vanta")
-            
+
         self.setWindowOpacity(0.0)
         self._init_ui()
         self._init_ram_slider()
-        # Defer RPC handshake until after initial paint
         QTimer.singleShot(1000, self._init_rpc)
         self._load_settings()
         self._fetch_versions()
@@ -574,11 +625,11 @@ class MinecraftLauncher(QMainWindow):
             self.rpc = None
             self._set_rpc_unavailable()
             return
-            
+
         if self.settings.value("rpc_enabled", "true") != "true":
             self.rpc = None
             return
-            
+
         def connect_discord():
             try:
                 with self._rpc_lock:
@@ -610,6 +661,7 @@ class MinecraftLauncher(QMainWindow):
                         self.rpc.update(state=state, details=details, start=int(time()))
                     except Exception:
                         pass
+
         threading.Thread(target=update_task, daemon=True).start()
 
     def _set_rpc_unavailable(self) -> None:
@@ -657,7 +709,9 @@ class MinecraftLauncher(QMainWindow):
         except Exception:
             return None
 
-    def _fade_out_with_shrink(self, finish_callback, *, target_geo: Optional[QRect] = None, slide_down: bool = False) -> None:
+    def _fade_out_with_shrink(self, finish_callback, *,
+                              target_geo: Optional[QRect] = None,
+                              slide_down: bool = False) -> None:
         self._stop_animations()
 
         opacity = QPropertyAnimation(self, b"windowOpacity")
@@ -775,7 +829,7 @@ class MinecraftLauncher(QMainWindow):
         if not self._is_closing:
             self._is_closing = True
             event.ignore()
-            
+
             def cleanup_and_close():
                 self._shutdown_workers()
                 with self._rpc_lock:
@@ -787,7 +841,7 @@ class MinecraftLauncher(QMainWindow):
                             pass
                         self.rpc = None
                 self.close()
-            
+
             self._fade_out_with_shrink(cleanup_and_close)
         else:
             event.accept()
@@ -807,7 +861,7 @@ class MinecraftLauncher(QMainWindow):
             self._fade_in()
 
     # ------------------------------------------------------------------
-    # Worker Lifecycle & System Helpers
+    # Worker lifecycle & system helpers
     # ------------------------------------------------------------------
 
     def _register_worker(self, worker: QThread) -> None:
@@ -831,7 +885,7 @@ class MinecraftLauncher(QMainWindow):
                         proc.wait(timeout=2)
                     except subprocess.TimeoutExpired:
                         proc.kill()
-                        proc.wait(timeout=1)
+                        proc.wait(timeout=5)
             except Exception:
                 pass
             if self._launch_worker.isRunning():
@@ -884,7 +938,7 @@ class MinecraftLauncher(QMainWindow):
                     return int(bytes_total / (1024 ** 3))
             except Exception:
                 pass
-        return 4 
+        return 4
 
     def _show_progress(self, visible: bool, text: str = "") -> None:
         if visible:
@@ -897,7 +951,7 @@ class MinecraftLauncher(QMainWindow):
             self.play_button.setText("Play")
 
     # ------------------------------------------------------------------
-    # GUI Construction
+    # GUI construction
     # ------------------------------------------------------------------
 
     def _init_ui(self) -> None:
@@ -907,14 +961,13 @@ class MinecraftLauncher(QMainWindow):
             icon_path = os.path.join(sys._MEIPASS, "icons", "icon.ico")
         else:
             icon_path = os.path.join(os.path.dirname(__file__), "icons", "icon.ico")
-            
+
         if os.path.exists(icon_path):
             self.setWindowIcon(QIcon(icon_path))
 
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowSystemMenuHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        
-        # Kept extremely tight and slick - matching user preferences
+
         self.setFixedSize(690, 270)
 
         arrow_path = _generate_arrow_image()
@@ -923,11 +976,10 @@ class MinecraftLauncher(QMainWindow):
         central = QWidget(self)
         self.setCentralWidget(central)
 
-        # Set the height to 220px to prevent empty dead vertical space
         self.card = QFrame(central, objectName="cardFrame")
         self.card.setGeometry(25, 25, 320, 220)
 
-        shadow = QGraphicsDropShadowEffect(self)
+        shadow = QGraphicsDropShadowEffect(self.card)
         shadow.setBlurRadius(24)
         shadow.setXOffset(0)
         shadow.setYOffset(6)
@@ -938,6 +990,7 @@ class MinecraftLauncher(QMainWindow):
         card_layout.setContentsMargins(20, 16, 20, 16)
         card_layout.setSpacing(10)
 
+        # Title bar
         title = QHBoxLayout()
         title.setContentsMargins(0, 0, 0, 0)
         title.setSpacing(8)
@@ -971,6 +1024,7 @@ class MinecraftLauncher(QMainWindow):
         title.addWidget(self._close_btn)
         card_layout.addLayout(title)
 
+        # Username & avatar
         nick_layout = QHBoxLayout()
         nick_layout.setContentsMargins(0, 0, 0, 0)
         nick_layout.setSpacing(8)
@@ -985,13 +1039,14 @@ class MinecraftLauncher(QMainWindow):
         nick_layout.addWidget(self.nick_input)
         card_layout.addLayout(nick_layout)
 
+        # Version selector
         self.version_combo = QComboBox()
         self.version_combo.addItem("Loading versions...")
         self.version_combo.setEnabled(False)
         self.version_combo.currentTextChanged.connect(self._on_version_changed)
         card_layout.addWidget(self.version_combo)
 
-        # Dynamic stacked container preventing layout shift during download/launch
+        # Play button & progress bar stack
         self.play_stack = QStackedWidget()
         self.play_stack.setFixedHeight(36)
 
@@ -1008,6 +1063,7 @@ class MinecraftLauncher(QMainWindow):
         self.play_stack.addWidget(self.progress_bar)
         card_layout.addWidget(self.play_stack)
 
+        # Settings / Mods drawer (hidden by default)
         self.drawer = QFrame(central, objectName="drawer")
         self.drawer.setGeometry(25, 25, 320, 220)
         self.drawer.stackUnder(self.card)
@@ -1029,6 +1085,7 @@ class MinecraftLauncher(QMainWindow):
         self.drawer_stack = QStackedWidget()
         drawer_layout.addWidget(self.drawer_stack)
 
+        # Settings tab
         settings_widget = QWidget()
         settings_layout = QVBoxLayout(settings_widget)
         settings_layout.setContentsMargins(0, 0, 0, 0)
@@ -1038,7 +1095,9 @@ class MinecraftLauncher(QMainWindow):
         ram_lbl = QLabel("Allocated RAM:")
         ram_lbl.setStyleSheet("color: #FFFFFF; font-family: 'Segoe UI', sans-serif; font-size: 12px;")
         self.ram_val_lbl = QLabel("4 GB")
-        self.ram_val_lbl.setStyleSheet("color: #0A84FF; font-family: 'Segoe UI', sans-serif; font-size: 12px; font-weight: bold;")
+        self.ram_val_lbl.setStyleSheet(
+            "color: #0A84FF; font-family: 'Segoe UI', sans-serif; font-size: 12px; font-weight: bold;"
+        )
         ram_header_layout.addWidget(ram_lbl)
         ram_header_layout.addStretch(1)
         ram_header_layout.addWidget(self.ram_val_lbl)
@@ -1063,6 +1122,7 @@ class MinecraftLauncher(QMainWindow):
 
         self.drawer_stack.addWidget(settings_widget)
 
+        # Mods manager tab
         mods_widget = QWidget()
         mods_layout = QVBoxLayout(mods_widget)
         mods_layout.setContentsMargins(0, 0, 0, 0)
@@ -1071,18 +1131,18 @@ class MinecraftLauncher(QMainWindow):
         search_layout = QHBoxLayout()
         search_layout.setContentsMargins(0, 0, 0, 0)
         search_layout.setSpacing(4)
-        
+
         self.mod_search_input = QLineEdit()
         self.mod_search_input.setPlaceholderText("Search Modrinth...")
         self.mod_search_input.setFixedHeight(26)
         self.mod_search_input.setStyleSheet("padding: 2px 8px; font-size: 11px;")
-        
+
         self._search_timer = QTimer()
         self._search_timer.setSingleShot(True)
         self._search_timer.setInterval(300)
         self._search_timer.timeout.connect(self._on_mod_search)
         self.mod_search_input.textChanged.connect(self._search_timer.start)
-        
+
         search_layout.addWidget(self.mod_search_input)
         mods_layout.addLayout(search_layout)
 
@@ -1102,6 +1162,7 @@ class MinecraftLauncher(QMainWindow):
 
         self.drawer_stack.addWidget(mods_widget)
 
+        # Avatar fetch timer
         self._avatar_timer = QTimer()
         self._avatar_timer.setSingleShot(True)
         self._avatar_timer.timeout.connect(self._fetch_avatar)
@@ -1179,13 +1240,13 @@ class MinecraftLauncher(QMainWindow):
         if not query:
             self._refresh_installed_mods()
             return
-            
+
         if hasattr(self, "_search_worker") and self._search_worker.isRunning():
             try:
                 self._search_worker.results_ready.disconnect()
             except Exception:
                 pass
-                
+
         self._search_worker = ModSearchWorker(query)
         self._register_worker(self._search_worker)
         self._search_worker.results_ready.connect(self._on_search_results)
@@ -1204,11 +1265,11 @@ class MinecraftLauncher(QMainWindow):
         self.mods_list.clear()
         self.mod_action_btn.setText("Refresh")
         self.mod_action_btn.setProperty("mode", "refresh")
-        
+
         version = self.version_combo.currentText()
         if not version or version == "Loading versions...":
             return
-            
+
         mods_dir = os.path.join(self.vanta_dir, "instances", version, "mods")
         if os.path.exists(mods_dir):
             for file in os.listdir(mods_dir):
@@ -1232,7 +1293,7 @@ class MinecraftLauncher(QMainWindow):
 
         self.mod_action_btn.setEnabled(False)
         self.mod_action_btn.setText("Preparing...")
-        
+
         instance_dir = os.path.join(self.vanta_dir, "instances", version)
         self._install_worker = ModInstallWorker(project_id, version, instance_dir)
         self._register_worker(self._install_worker)
@@ -1256,12 +1317,20 @@ class MinecraftLauncher(QMainWindow):
         selected_item = self.mods_list.currentItem()
         if not selected_item:
             return
-            
+
         filename = selected_item.text()
         version = self.version_combo.currentText()
         if not version or version == "Loading versions...":
             return
-            
+
+        # Prevent accidental removal of Fabric API
+        if "fabric-api" in filename.lower() or "fabric_api" in filename.lower():
+            QMessageBox.warning(
+                self, "Cannot Delete",
+                "Fabric API is required for mod support and cannot be removed from here."
+            )
+            return
+
         filepath = os.path.join(self.vanta_dir, "instances", version, "mods", filename)
         if os.path.exists(filepath):
             try:
@@ -1509,7 +1578,7 @@ class MinecraftLauncher(QMainWindow):
         saved_ram = int(self.settings.value("ram_gb", 4))
         self.ram_slider.setValue(min(saved_ram, self.ram_slider.maximum()))
         self.perf_checkbox.setChecked(self.settings.value("performance_mode", "true") == "true")
-        
+
         rpc_on = self.settings.value("rpc_enabled", "true") == "true"
         self.rpc_checkbox.blockSignals(True)
         self.rpc_checkbox.setChecked(rpc_on)
@@ -1553,7 +1622,7 @@ class MinecraftLauncher(QMainWindow):
             self.version_combo.addItems(combined)
 
         self.version_combo.setEnabled(True)
-        
+
         saved_version = self.settings.value("version", "")
         if saved_version in combined:
             self.version_combo.setCurrentText(saved_version)
@@ -1563,7 +1632,33 @@ class MinecraftLauncher(QMainWindow):
         self.version_combo.setEnabled(enabled)
         self.play_button.setEnabled(enabled)
 
+    def _prompt_java_download(self, runtime_name: str, on_download: callable) -> bool:
+        """Shows a dialog offering to download a required Java runtime."""
+        reply = QMessageBox.question(
+            self,
+            "Java Runtime Missing",
+            f"Minecraft {self.version_combo.currentText()} requires the '{runtime_name}' "
+            "Java runtime, which is not installed.\n\n"
+            "Would you like the launcher to download and install it automatically?\n"
+            "No administrator privileges are required.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            on_download()
+            return True
+        QMessageBox.warning(
+            self,
+            "Cannot Launch",
+            "A compatible Java runtime is required to start Minecraft.\n"
+            "Please install one manually or allow the launcher to download it."
+        )
+        return False
+
     def _launch_game(self) -> None:
+        if self._launch_in_progress:
+            return
+
         username = self.nick_input.text().strip()
         version = self.version_combo.currentText()
 
@@ -1576,63 +1671,78 @@ class MinecraftLauncher(QMainWindow):
             return
 
         self._save_settings()
+        self._launch_in_progress = True
 
         required_runtime = None
         try:
             runtime_info = minecraft_launcher_lib.runtime.get_version_runtime_information(
                 version, self.minecraft_dir
             )
-            required_runtime = runtime_info.get("name")
+            required_runtime = runtime_info.get("name") if runtime_info else None
         except Exception:
             pass
 
+        def start_launch(java_exec: Optional[str] = None):
+            self._set_ui_enabled(False)
+            self._show_progress(True, "Preparing")
+            ram = self.ram_slider.value()
+            perf = self.perf_checkbox.isChecked() and is_fabric_compatible(version)
+
+            self._update_rpc(state="In-Game", details=f"Playing Minecraft {version}")
+
+            self._launch_worker = LaunchWorker(username, version, self.minecraft_dir,
+                                               ram, perf, java_path=java_exec)
+            self._register_worker(self._launch_worker)
+            self._launch_worker.progress_updated.connect(self._on_launch_progress)
+            self._launch_worker.launch_success.connect(self._on_launch_success)
+            self._launch_worker.game_exited.connect(self._on_game_exited)
+            self._launch_worker.error_occurred.connect(self._on_launch_error)
+            self._launch_worker.performance_mods_installed.connect(self._refresh_installed_mods)
+            self._launch_worker.start()
+
         if required_runtime:
-            java_exec = minecraft_launcher_lib.runtime.get_executable_path(required_runtime, self.minecraft_dir)
+            java_exec = minecraft_launcher_lib.runtime.get_executable_path(
+                required_runtime, self.minecraft_dir
+            )
             if not java_exec:
-                reply = QMessageBox.question(
-                    self,
-                    "Java Runtime Missing",
-                    f"Minecraft {version} requires the '{required_runtime}' Java runtime, which is not installed.\n\n"
-                    "Would you like the launcher to download and install it automatically?\n"
-                    "No administrator privileges are required.",
-                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                    QMessageBox.StandardButton.Yes
-                )
-                if reply == QMessageBox.StandardButton.Yes:
+                def on_download():
                     self._set_ui_enabled(False)
                     self._show_progress(True, "Downloading Java")
                     self._java_worker = JavaDownloadWorker(required_runtime, self.minecraft_dir)
                     self._register_worker(self._java_worker)
                     self._java_worker.progress.connect(self._on_java_progress)
-                    self._java_worker.finished.connect(lambda: self._start_game_launch(username, version))
+                    self._java_worker.finished.connect(lambda: start_launch(java_exec))
                     self._java_worker.error.connect(self._on_java_error)
                     self._java_worker.start()
+
+                if not self._prompt_java_download(required_runtime, on_download):
+                    self._launch_in_progress = False
                 return
+            else:
+                start_launch(java_exec)
         else:
+            # No specific runtime required; check for any Java in PATH or legacy bundle
+            java_exec = None
             if not shutil.which("java"):
-                legacy_exec = minecraft_launcher_lib.runtime.get_executable_path("jre-legacy", self.minecraft_dir)
+                legacy_exec = minecraft_launcher_lib.runtime.get_executable_path(
+                    "jre-legacy", self.minecraft_dir
+                )
                 if not legacy_exec:
-                    reply = QMessageBox.question(
-                        self,
-                        "Java Runtime Missing",
-                        "No Java installation was detected, and the fallback legacy runtime is not available.\n\n"
-                        "Would you like the launcher to download the legacy Java runtime?\n"
-                        "No administrator privileges are required.",
-                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                        QMessageBox.StandardButton.Yes
-                    )
-                    if reply == QMessageBox.StandardButton.Yes:
+                    def on_download():
                         self._set_ui_enabled(False)
                         self._show_progress(True, "Downloading Java")
                         self._java_worker = JavaDownloadWorker("jre-legacy", self.minecraft_dir)
                         self._register_worker(self._java_worker)
                         self._java_worker.progress.connect(self._on_java_progress)
-                        self._java_worker.finished.connect(lambda: self._start_game_launch(username, version))
+                        self._java_worker.finished.connect(lambda: start_launch(None))
                         self._java_worker.error.connect(self._on_java_error)
                         self._java_worker.start()
-                    return
 
-        self._start_game_launch(username, version)
+                    if not self._prompt_java_download("legacy runtime", on_download):
+                        self._launch_in_progress = False
+                    return
+                java_exec = legacy_exec
+            start_launch(java_exec)
 
     def _on_java_progress(self, status: str, percent: int) -> None:
         if percent >= 0:
@@ -1645,28 +1755,12 @@ class MinecraftLauncher(QMainWindow):
     def _on_java_error(self, error_message: str) -> None:
         self._set_ui_enabled(True)
         self._show_progress(False)
+        self._launch_in_progress = False
         QMessageBox.critical(
             self,
             "Java Install Error",
             f"Failed to install portable Java runtime:\n\n{error_message}",
         )
-
-    def _start_game_launch(self, username: str, version: str) -> None:
-        self._set_ui_enabled(False)
-        self._show_progress(True, "Preparing")
-        ram = self.ram_slider.value()
-        perf = self.perf_checkbox.isChecked() and is_fabric_compatible(version)
-        
-        self._update_rpc(state="In-Game", details=f"Playing Minecraft {version}")
-
-        self._launch_worker = LaunchWorker(username, version, self.minecraft_dir, ram, perf)
-        self._register_worker(self._launch_worker)
-        self._launch_worker.progress_updated.connect(self._on_launch_progress)
-        self._launch_worker.launch_success.connect(self._on_launch_success)
-        self._launch_worker.game_exited.connect(self._on_game_exited)
-        self._launch_worker.error_occurred.connect(self._on_launch_error)
-        self._launch_worker.performance_mods_installed.connect(self._refresh_installed_mods)
-        self._launch_worker.start()
 
     def _on_launch_progress(self, status: str, percent: int) -> None:
         if percent >= 0:
@@ -1680,6 +1774,7 @@ class MinecraftLauncher(QMainWindow):
         self._fade_out_with_shrink(self.hide)
 
     def _on_game_exited(self) -> None:
+        self._launch_in_progress = False
         self.setWindowOpacity(0.0)
         self.show()
         self._set_ui_enabled(True)
@@ -1688,6 +1783,7 @@ class MinecraftLauncher(QMainWindow):
         self._update_rpc(state="Free Non-Premium Launcher", details="Playing Minecraft")
 
     def _on_launch_error(self, error_message: str) -> None:
+        self._launch_in_progress = False
         self._set_ui_enabled(True)
         self._show_progress(False)
         self.play_button.setText("Play")
@@ -1700,11 +1796,15 @@ class MinecraftLauncher(QMainWindow):
 
 
 if __name__ == "__main__":
+    import json  # needed for ModSearchWorker params
+
     silence_asyncio_windows_bugs()
 
     if sys.platform == "win32":
         try:
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("vanta.launcher.minecraft.1.1")
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                "vanta.launcher.minecraft.1.1"
+            )
         except Exception as e:
             sys.stderr.write(f"Failed to configure taskbar AppUserModelID: {e}\n")
 
