@@ -31,7 +31,7 @@ import minecraft_launcher_lib.runtime
 import minecraft_launcher_lib.fabric
 
 API_HEADERS = {
-    "User-Agent": "VantaLauncher/1.1 (+https://github.com/vantalauncher; support@vantalauncher.dev)"
+    "User-Agent": "VantaLauncher/1.5 (+https://github.com/salo-yek/vanta; support@getvanta.xyz)"
 }
 
 
