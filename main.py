@@ -85,6 +85,17 @@ def is_fabric_compatible(version: str) -> bool:
         return False
 
 
+def matches_mod(filename: str, mod_id: str) -> bool:
+    """Check if the filename matches a specific mod ID, handling overlaps like sodium vs sodium-extra."""
+    fn = filename.lower().replace("-", "").replace("_", "")
+    m = mod_id.lower().replace("-", "").replace("_", "")
+    if m == "sodium":
+        return "sodium" in fn and "extra" not in fn
+    return m in fn
+
+
+
+
 class VersionFetchWorker(QThread):
     versions_fetched = pyqtSignal(list)
     error_occurred = pyqtSignal(str)
@@ -357,28 +368,7 @@ class LaunchWorker(QThread):
                 seen.add(m)
                 mods.append(m)
 
-        try:
-            local_files = [
-                f.lower().replace("-", "").replace("_", "")
-                for f in os.listdir(mods_dir) if f.endswith(".jar")
-            ]
-        except Exception:
-            local_files = []
-
-        mod_signatures = {
-            "fabric-api": "fabricapi",
-            "sodium": "sodium",
-            "lithium": "lithium",
-            "ferrite-core": "ferrite",
-            "entityculling": "entityculling"
-        }
-
         for i, mod in enumerate(mods):
-            sig = mod_signatures.get(mod, mod).replace("-", "").replace("_", "")
-
-            if any(sig in f for f in local_files):
-                continue
-
             try:
                 self.progress_updated.emit(f"Checking {mod}...", int(20 + (i / len(mods)) * 60))
                 params = {
@@ -387,32 +377,52 @@ class LaunchWorker(QThread):
                 }
                 url = f"https://api.modrinth.com/v2/project/{mod}/version"
                 r = requests.get(url, headers=API_HEADERS, params=params, timeout=5)
+
+                target_filename = None
+                file_info = None
+
                 if r.status_code == 200:
                     data = r.json()
-                    if not data or not isinstance(data, list) or len(data) == 0:
-                        continue
+                    if data and isinstance(data, list) and len(data) > 0:
+                        files_list = data[0].get("files", [])
+                        if files_list:
+                            file_info = files_list[0]
+                            for f in files_list:
+                                if f.get("primary"):
+                                    file_info = f
+                                    break
+                            target_filename = file_info["filename"]
 
-                    files_list = data[0].get("files", [])
-                    if not files_list:
-                        continue
+                if target_filename:
+                    # Clean up other versions of this mod
+                    if os.path.exists(mods_dir):
+                        for f in os.listdir(mods_dir):
+                            if f.endswith(".jar") and matches_mod(f, mod) and f != target_filename:
+                                try:
+                                    os.remove(os.path.join(mods_dir, f))
+                                except Exception as del_err:
+                                    sys.stderr.write(f"Failed to delete old mod version {f}: {del_err}\n")
 
-                    file_info = files_list[0]
-                    for f in files_list:
-                        if f.get("primary"):
-                            file_info = f
-                            break
-
-                    dest_path = os.path.join(mods_dir, file_info["filename"])
-                    if os.path.exists(dest_path):
-                        continue
-
-                    self.progress_updated.emit(f"Downloading {mod}...", int(20 + (i / len(mods)) * 60))
-                    dl_res = requests.get(file_info["url"], headers=API_HEADERS, timeout=10)
-                    if dl_res.status_code == 200:
-                        with open(dest_path, "wb") as out:
-                            out.write(dl_res.content)
+                    # Download if missing
+                    dest_path = os.path.join(mods_dir, target_filename)
+                    if not os.path.exists(dest_path):
+                        self.progress_updated.emit(f"Downloading {mod}...", int(20 + (i / len(mods)) * 60))
+                        dl_res = requests.get(file_info["url"], headers=API_HEADERS, timeout=10)
+                        if dl_res.status_code == 200:
+                            with open(dest_path, "wb") as out:
+                                out.write(dl_res.content)
+                else:
+                    # Offline fallback: if any local file matches the signature, we keep it
+                    local_match = False
+                    if os.path.exists(mods_dir):
+                        for f in os.listdir(mods_dir):
+                            if f.endswith(".jar") and matches_mod(f, mod):
+                                local_match = True
+                                break
+                    if not local_match:
+                        sys.stderr.write(f"Mod {mod} could not be resolved from API and is missing locally.\n")
             except Exception as e:
-                sys.stderr.write(f"Error downloading {mod}: {e}\n")
+                sys.stderr.write(f"Error checking/downloading {mod}: {e}\n")
 
         self.performance_mods_installed.emit()
 
@@ -495,9 +505,20 @@ class ModInstallWorker(QThread):
                         file_info = f
                         break
 
-                self.progress.emit(f"Downloading {file_info['filename']}...")
-                dest = os.path.join(self.instance_dir, "mods", file_info["filename"])
-                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                target_filename = file_info["filename"]
+                self.progress.emit(f"Downloading {target_filename}...")
+                mods_dir = os.path.join(self.instance_dir, "mods")
+                dest = os.path.join(mods_dir, target_filename)
+                os.makedirs(mods_dir, exist_ok=True)
+
+                # Clean up other versions of this mod
+                if os.path.exists(mods_dir):
+                    for f in os.listdir(mods_dir):
+                        if f.endswith(".jar") and matches_mod(f, self.project_id) and f != target_filename:
+                            try:
+                                os.remove(os.path.join(mods_dir, f))
+                            except Exception:
+                                pass
 
                 dl_res = requests.get(file_info["url"], headers=API_HEADERS, timeout=10)
                 if dl_res.status_code == 200:
@@ -516,47 +537,54 @@ class ModInstallWorker(QThread):
         os.makedirs(mods_dir, exist_ok=True)
 
         try:
-            local_files = [
-                f.lower().replace("-", "").replace("_", "")
-                for f in os.listdir(mods_dir) if f.endswith(".jar")
-            ]
-        except Exception:
-            local_files = []
-
-        if any("fabricapi" in f for f in local_files):
-            return
-
-        self.progress.emit("Downloading Fabric API dependency...")
-        try:
             params = {
                 "loaders": json.dumps(["fabric"]),
                 "game_versions": json.dumps([self.mc_version])
             }
             r = requests.get("https://api.modrinth.com/v2/project/fabric-api/version",
                              headers=API_HEADERS, params=params, timeout=5)
+
+            target_filename = None
+            file_info = None
             if r.status_code == 200:
                 data = r.json()
-                if not data or not isinstance(data, list) or len(data) == 0:
-                    return
+                if data and isinstance(data, list) and len(data) > 0:
+                    files_list = data[0].get("files", [])
+                    if files_list:
+                        file_info = files_list[0]
+                        for f in files_list:
+                            if f.get("primary"):
+                                file_info = f
+                                break
+                        target_filename = file_info["filename"]
 
-                files_list = data[0].get("files", [])
-                if not files_list:
-                    return
+            if target_filename:
+                # Clean up any other fabric-api versions
+                if os.path.exists(mods_dir):
+                    for f in os.listdir(mods_dir):
+                        if f.endswith(".jar") and matches_mod(f, "fabric-api") and f != target_filename:
+                            try:
+                                os.remove(os.path.join(mods_dir, f))
+                            except Exception:
+                                pass
 
-                file_info = files_list[0]
-                for f in files_list:
-                    if f.get("primary"):
-                        file_info = f
-                        break
-
-                dest_path = os.path.join(mods_dir, file_info["filename"])
-                if os.path.exists(dest_path):
-                    return
-
-                dl_res = requests.get(file_info["url"], headers=API_HEADERS, timeout=10)
-                if dl_res.status_code == 200:
-                    with open(dest_path, "wb") as out:
-                        out.write(dl_res.content)
+                dest_path = os.path.join(mods_dir, target_filename)
+                if not os.path.exists(dest_path):
+                    self.progress.emit("Downloading Fabric API dependency...")
+                    dl_res = requests.get(file_info["url"], headers=API_HEADERS, timeout=10)
+                    if dl_res.status_code == 200:
+                        with open(dest_path, "wb") as out:
+                            out.write(dl_res.content)
+            else:
+                # Fallback check
+                local_match = False
+                if os.path.exists(mods_dir):
+                    for f in os.listdir(mods_dir):
+                        if f.endswith(".jar") and matches_mod(f, "fabric-api"):
+                            local_match = True
+                            break
+                if not local_match:
+                    self.progress.emit("Fabric API is missing and could not be downloaded.")
         except Exception as e:
             sys.stderr.write(f"Failed to auto-download Fabric API: {e}\n")
 
